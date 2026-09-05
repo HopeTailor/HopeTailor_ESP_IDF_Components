@@ -92,3 +92,102 @@ esp_err_t ht_vl53l1x_init(i2c_master_bus_handle_t bus_handle, uint8_t i2c_addr, 
     ESP_LOGI(TAG, "Basic initialization completed");
     return ESP_OK;
 }
+
+/* =========================================================================
+ *                    CORE CONTROL FUNCTIONS (Step 2)
+ * ========================================================================= */
+
+esp_err_t ht_vl53l1x_start_ranging(ht_vl53l1x_dev_t *dev) {
+    if (dev == NULL) return ESP_ERR_INVALID_ARG;
+    
+    ESP_LOGI(TAG, "Starting continuous ranging...");
+    /* 
+     * Write 0x40 to SYSTEM_MODE_START (0x0087) 
+     * This commands the sensor's internal state machine to start firing the laser.
+     */
+    return ht_i2c_write_reg16(dev->i2c_dev, VL53L1X_REG_SYSTEM_MODE_START, 0x40);
+}
+
+esp_err_t ht_vl53l1x_stop_ranging(ht_vl53l1x_dev_t *dev) {
+    if (dev == NULL) return ESP_ERR_INVALID_ARG;
+    
+    ESP_LOGI(TAG, "Stopping ranging to save power...");
+    /* Write 0x00 to SYSTEM_MODE_START to halt measurements */
+    return ht_i2c_write_reg16(dev->i2c_dev, VL53L1X_REG_SYSTEM_MODE_START, 0x00);
+}
+
+esp_err_t ht_vl53l1x_check_data_ready(ht_vl53l1x_dev_t *dev, bool *is_ready) {
+    if (dev == NULL || is_ready == NULL) return ESP_ERR_INVALID_ARG;
+    
+    uint8_t status = 0;
+    /* Read the hardware interrupt status register (0x0031) */
+    esp_err_t err = ht_i2c_read_regs16(dev->i2c_dev, VL53L1X_REG_GPIO_TIO_HV_STATUS, &status, 1);
+    if (err != ESP_OK) return err;
+
+    /* 
+     * Based on our default 109-byte configuration, bit 0 of this register 
+     * will flip to 1 when a new valid measurement is available.
+     */
+    *is_ready = (status & 0x01) == 1;
+    return ESP_OK;
+}
+
+esp_err_t ht_vl53l1x_get_result(ht_vl53l1x_dev_t *dev, ht_vl53l1x_result_t *result) {
+    if (dev == NULL || result == NULL) return ESP_ERR_INVALID_ARG;
+
+    esp_err_t err;
+    uint8_t data_buf[2];
+
+    /* 1. Read the 16-bit distance in millimeters from register 0x0096 */
+    err = ht_i2c_read_regs16(dev->i2c_dev, VL53L1X_REG_RESULT_DISTANCE_MM, data_buf, 2);
+    if (err != ESP_OK) return err;
+    
+    /* Combine the two bytes (High Byte << 8 | Low Byte) */
+    result->distance_mm = (data_buf[0] << 8) | data_buf[1];
+
+    /* 2. Read the Range Status from register 0x0089 to check for errors/noise */
+    err = ht_i2c_read_regs16(dev->i2c_dev, VL53L1X_REG_RESULT_RANGE_STATUS, &result->range_status, 1);
+    if (err != ESP_OK) return err;
+    
+    /* Standard ST practice: Mask the status byte to get the exact error code */
+    result->range_status = result->range_status & 0x1F;
+
+    /* 
+     * 3. CRITICAL STEP: Clear the internal interrupt flag.
+     * If we don't write 0x01 to register 0x0086, the sensor will freeze 
+     * and never take another measurement!
+     */
+    err = ht_i2c_write_reg16(dev->i2c_dev, VL53L1X_REG_SYSTEM_INTERRUPT_CLEAR, 0x01);
+    
+    return err;
+}
+
+esp_err_t ht_vl53l1x_set_roi(ht_vl53l1x_dev_t *dev, const ht_vl53l1x_roi_config_t *roi) {
+    if (dev == NULL || roi == NULL) return ESP_ERR_INVALID_ARG;
+
+    /* Boundary check: Width and Height must be strictly between 4 and 16 */
+    uint8_t w = (roi->width > 16) ? 16 : ((roi->width < 4) ? 4 : roi->width);
+    uint8_t h = (roi->height > 16) ? 16 : ((roi->height < 4) ? 4 : roi->height);
+    
+    /* 
+     * The sensor expects a single byte for size.
+     * Format: High nibble = Height - 1, Low nibble = Width - 1
+     */
+    uint8_t roi_xy_size = ((h - 1) << 4) | (w - 1);
+
+    esp_err_t err = ESP_OK;
+    
+    /* 0x007F: Set ROI Center SPAD */
+    err |= ht_i2c_write_reg16(dev->i2c_dev, 0x007F, roi->center_spad);
+    
+    /* 0x007E: Set ROI Size (XY) */
+    err |= ht_i2c_write_reg16(dev->i2c_dev, 0x007E, roi_xy_size);
+    
+    if (err == ESP_OK) {
+        dev->current_cfg.roi = *roi; /* Update the cached struct */
+        ESP_LOGI(TAG, "ROI dynamically updated -> Center: %d, Size: %dx%d", roi->center_spad, w, h);
+    }
+    
+    return err;
+}
+
