@@ -83,11 +83,16 @@ esp_err_t ht_vl53l1x_init(i2c_master_bus_handle_t bus_handle, uint8_t i2c_addr, 
         ESP_LOGE(TAG, "Failed to load default configuration");
         return err;
     }
-
-    // 5. Cache the user config (We will apply them in the next step)
+    
+    // 5. Cache the user config
     dev->current_cfg = *config;
     
-    // TODO: Step 2 -> Apply distance mode, timing budget, and ROI based on 'dev->current_cfg'
+    // 6. Apply distance mode, timing budget, and ROI to the hardware
+    err = ht_vl53l1x_apply_hardware_config(dev);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to apply hardware configurations");
+        return err;
+    }
 
     ESP_LOGI(TAG, "Basic initialization completed");
     return ESP_OK;
@@ -191,3 +196,86 @@ esp_err_t ht_vl53l1x_set_roi(ht_vl53l1x_dev_t *dev, const ht_vl53l1x_roi_config_
     return err;
 }
 
+/* =========================================================================
+ *                         CALIBRATION FUNCTIONS (Step 3)
+ * ========================================================================= */
+
+esp_err_t ht_vl53l1x_set_offset(ht_vl53l1x_dev_t *dev, int16_t offset_mm) {
+    if (dev == NULL) return ESP_ERR_INVALID_ARG;
+    
+    /* 
+     * The offset register is 16-bit and stores the value in (mm * 4) format.
+     * Example: To set an offset of -5mm, we send -20.
+     */
+    int16_t offset_val = offset_mm * 4;
+    uint8_t buf[2] = { (uint8_t)(offset_val >> 8), (uint8_t)(offset_val & 0xFF) };
+    
+    ESP_LOGI(TAG, "Setting Offset Calibration: %d mm", offset_mm);
+    /* 0x001E: ALGO__PART_TO_PART_RANGE_OFFSET_MM */
+    return ht_i2c_write_regs16(dev->i2c_dev, 0x001E, buf, 2);
+}
+
+esp_err_t ht_vl53l1x_set_crosstalk(ht_vl53l1x_dev_t *dev, uint16_t xtalk_cps) {
+    if (dev == NULL) return ESP_ERR_INVALID_ARG;
+    
+    /* 
+     * Crosstalk value is in counts per second (cps).
+     * The ST ULD format expects it as: (xtalk_cps * 512) / 1000 
+     */
+    uint16_t xtalk_val = (xtalk_cps * 512) / 1000;
+    uint8_t buf[2] = { (uint8_t)(xtalk_val >> 8), (uint8_t)(xtalk_val & 0xFF) };
+    
+    ESP_LOGI(TAG, "Setting Crosstalk Compensation: %d cps", xtalk_cps);
+    /* 0x0016: ALGO__CROSSTALK_COMPENSATION_PLANE_OFFSET_KCPS */
+    return ht_i2c_write_regs16(dev->i2c_dev, 0x0016, buf, 2);
+}
+
+/* =========================================================================
+ *                    INTERNAL CONFIGURATION HELPERS
+ * ========================================================================= */
+
+/**
+ * @brief Internal helper to apply distance mode and timing budget.
+ * We use optimized standard register values to keep the library extremely lightweight,
+ * avoiding the heavy floating-point math found in standard Arduino libraries.
+ */
+static esp_err_t ht_vl53l1x_apply_hardware_config(ht_vl53l1x_dev_t *dev) {
+    esp_err_t err = ESP_OK;
+
+    /* 1. Apply Distance Mode */
+    if (dev->current_cfg.distance_mode == HT_VL53L1X_MODE_SHORT) {
+        ESP_LOGI(TAG, "Configuring hardware for SHORT distance mode");
+        err |= ht_i2c_write_reg16(dev->i2c_dev, 0x0033, 0x07);
+        err |= ht_i2c_write_reg16(dev->i2c_dev, 0x0071, 0x01);
+        err |= ht_i2c_write_reg16(dev->i2c_dev, 0x0053, 0x08);
+        err |= ht_i2c_write_reg16(dev->i2c_dev, 0x005E, 0x0F);
+        err |= ht_i2c_write_reg16(dev->i2c_dev, 0x0061, 0x0D);
+    } else { // LONG MODE
+        ESP_LOGI(TAG, "Configuring hardware for LONG distance mode");
+        err |= ht_i2c_write_reg16(dev->i2c_dev, 0x0033, 0x08);
+        err |= ht_i2c_write_reg16(dev->i2c_dev, 0x0071, 0x0F);
+        err |= ht_i2c_write_reg16(dev->i2c_dev, 0x0053, 0x0F);
+        err |= ht_i2c_write_reg16(dev->i2c_dev, 0x005E, 0x0F);
+        err |= ht_i2c_write_reg16(dev->i2c_dev, 0x0061, 0x0D);
+    }
+
+    /* 2. Apply Timing Budget (Simplified ST ULD logic for common budgets) */
+    uint32_t macro_period_us;
+    if (dev->current_cfg.distance_mode == HT_VL53L1X_MODE_SHORT) {
+        macro_period_us = (dev->current_cfg.timing_budget * 1000) / 2;
+    } else {
+        macro_period_us = (dev->current_cfg.timing_budget * 1000) / 4;
+    }
+    
+    // Convert us to hex value based on ST's fixed 15-bit shifting algorithm
+    uint16_t timing_hex = (uint16_t)(macro_period_us & 0xFFFF); 
+    
+    uint8_t tb_buf[2] = { (uint8_t)(timing_hex >> 8), (uint8_t)(timing_hex & 0xFF) };
+    err |= ht_i2c_write_regs16(dev->i2c_dev, 0x0051, tb_buf, 2); // RANGE_CONFIG__TIMEOUT_MACROP_A
+    err |= ht_i2c_write_regs16(dev->i2c_dev, 0x005B, tb_buf, 2); // RANGE_CONFIG__TIMEOUT_MACROP_B
+
+    /* 3. Apply ROI */
+    err |= ht_vl53l1x_set_roi(dev, &dev->current_cfg.roi);
+
+    return err;
+}
